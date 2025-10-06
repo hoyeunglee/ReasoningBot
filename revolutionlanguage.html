@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Resolution Helper: Auto-mapping, CNF, Query, and Answers</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { background:#0e0f13; color:#e6e7ea; font-family:Inter,Segoe UI,system-ui; margin:0; }
+    .container { max-width:1100px; margin:24px auto; padding:20px; }
+    .panel { background:#15171e; border:1px solid #22252c; border-radius:10px; padding:14px; margin-bottom:14px; }
+    textarea,input { width:100%; background:#101217; color:#e6e7ea; border:1px solid #25272d; border-radius:8px; padding:10px; font-family:monospace; }
+    button { background:#4f8cff; color:white; border:none; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:600; }
+    button.ghost { background:transparent; border:1px solid #30343b; color:#cbd2ff; }
+    .row { display:flex; gap:12px; }
+    .col { flex:1; }
+    .small { font-size:0.9rem; color:#aab3c9; margin-top:8px; }
+    pre { white-space:pre-wrap; word-break:break-word; background:#0f1114; padding:10px; border-radius:6px; border:1px solid #1c2026; }
+    label { display:block; font-weight:700; margin-bottom:6px; }
+    .hint { font-size:0.85rem; color:#9aa3bb; }
+    .answer { background:#0f141f; border:1px solid #273047; border-radius:8px; padding:10px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Resolution Helper: Auto-mapping, CNF, Query, and Answers</h2>
+
+    <section class="panel">
+      <label for="passage">Input passage</label>
+      <textarea id="passage" rows="6" placeholder="Paste story or facts here..."></textarea>
+      <div style="margin-top:8px;">
+        <button id="autoMap">Auto-map & generate CNF</button>
+        <button id="clear" class="ghost">Clear</button>
+        <button id="loadExample" class="ghost">Load Sharma example</button>
+      </div>
+      <div class="small hint">Heuristics extract facts and simple implications. Review mapping and CNF before resolution.</div>
+    </section>
+
+    <section class="panel row">
+      <div class="col">
+        <label for="mapping">Symbol mapping (auto)</label>
+        <textarea id="mapping" rows="8" placeholder="A: ..."></textarea>
+        <div class="small hint">Edit mappings if needed; symbols are single letters A..Z.</div>
+      </div>
+
+      <div class="col">
+        <label for="premises">Premises (CNF clauses)</label>
+        <textarea id="premises" rows="8" placeholder="(A)\n(¬A ∨ B)\n..."></textarea>
+        <div class="small hint">Auto-generated facts and implications; adjust for precise logic.</div>
+      </div>
+    </section>
+
+    <section class="panel row">
+      <div class="col">
+        <label for="reasoningQuery">Reasoning question (natural language)</label>
+        <textarea id="reasoningQuery" rows="2" placeholder="e.g., Who are Raj's daughters?"></textarea>
+      </div>
+      <div class="col">
+        <label for="query">Query to prove (auto-filled)</label>
+        <input id="query" type="text" placeholder="Symbol (e.g., C)" />
+        <div style="margin-top:10px;">
+          <button id="run">Run resolution</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <label>Answer</label>
+      <div id="nlAnswer" class="answer">(no answer yet)</div>
+      <div class="small hint">The answer engine uses targeted patterns (who/what/when) and named entities. It complements the resolution proof.</div>
+    </section>
+
+    <section class="panel">
+      <label>Symbol mapping and interpretation</label>
+      <pre id="mappingOutput">(none)</pre>
+    </section>
+
+    <section class="panel">
+      <label>Resolution steps</label>
+      <pre id="stepsOutput">(no run yet)</pre>
+    </section>
+
+    <section class="panel">
+      <label>All clauses explored</label>
+      <pre id="clausesOutput">(no run yet)</pre>
+    </section>
+
+  </div>
+
+  <script>
+  // ---------- Utilities ----------
+  const symOr = '∨', symNot = '¬';
+
+  function stem(word) {
+    word = word.toLowerCase().replace(/[^a-z]/g,'');
+    if (word.length <= 4) return word;
+    return word.replace(/(ing|ed|es|s)$/,'');
+  }
+  function tokenizeWords(text){ return text.toLowerCase().match(/\b[a-z]{2,}\b/g) || []; }
+
+  // ---------- Sentence processing ----------
+  function splitSentences(text){
+    return text.split(/(?<=[.?!])\s+/).map(s=>s.trim()).filter(Boolean);
+  }
+
+  // ---------- Pattern detection ----------
+  function detectPattern(sentence){
+    const s = sentence.replace(/\s+/g,' ').trim();
+    const lower = s.toLowerCase();
+
+    const ifMatch = lower.match(/\bif\b(.+?)\bthen\b(.+)/i);
+    if(ifMatch){
+      const antecedent = ifMatch[1].trim().replace(/^[,:;]+|[,:;]+$/g,'');
+      const consequent = ifMatch[2].trim().replace(/[.]+$/,'');
+      return {type:'implication', antecedent, consequent, raw: s};
+    }
+
+    // generic facts (copula and possession common forms)
+    const isMatch = s.match(/(.+?)\s+(is|are|was|were)\s+(.+)/i);
+    if(isMatch){
+      return {type:'fact', predicate:'copula', subj:isMatch[1].trim(), obj:isMatch[3].trim().replace(/[.,]$/,''), raw:s};
+    }
+
+    const haveMatch = s.match(/(.+?)\s+(has|had|have)\s+(.+)/i);
+    if(haveMatch){
+      return {type:'fact', predicate:'have', subj:haveMatch[1].trim(), obj:haveMatch[3].trim().replace(/[.,]$/,''), raw:s};
+    }
+
+    // fallback atomic sentence
+    return {type:'fact', predicate:'stmt', subj:null, obj:s, raw:s};
+  }
+
+  // ---------- Symbol assignment ----------
+  function assignSymbols(structs){
+    const entries = [];
+    let code = 'A'.charCodeAt(0);
+    for(const st of structs){
+      if(code > 'Z'.charCodeAt(0)) break;
+      const sym = String.fromCharCode(code++);
+      entries.push({sym, struct:st});
+    }
+    return {entries};
+  }
+
+  // ---------- CNF generation ----------
+  function parseClauseText(line){
+    if(!line) return null;
+    let s = line.trim();
+    if(s.startsWith('(') && s.endsWith(')')) s = s.slice(1,-1);
+    const parts = s.split(/[∨v|]/).map(x=>x.trim()).filter(Boolean);
+    return {lits: Array.from(new Set(parts)).sort()};
+  }
+  function complement(lit){ return lit.startsWith(symNot) ? lit.slice(1) : symNot + lit; }
+  function clToStr(cl){ return cl.empty ? '∅' : '(' + cl.lits.join(' '+symOr+' ') + ')'; }
+  function resolveTwo(c1, c2){
+    const resolvents = [];
+    for(const lit of c1.lits){
+      const comp = complement(lit);
+      if(c2.lits.includes(comp)){
+        const newSet = new Set([...c1.lits.filter(x=>x!==lit), ...c2.lits.filter(x=>x!==comp)]);
+        if(newSet.size===0) resolvents.push({empty:true, lits:[]}); else resolvents.push({lits:Array.from(newSet).sort()});
+      }
+    }
+    return resolvents;
+  }
+  function resolutionProveFromClauses(clauses, negQueryClause){
+    const S = []; const seen = new Set();
+    function add(cl){ const key = cl.empty ? '∅' : cl.lits.join('|'); if(seen.has(key)) return false; seen.add(key); S.push(cl); return true; }
+    clauses.forEach(add); add(negQueryClause);
+    const steps = [];
+    let newDerived = true;
+    while(newDerived){
+      newDerived = false;
+      for(let i=0;i<S.length;i++){
+        for(let j=i+1;j<S.length;j++){
+          const res = resolveTwo(S[i], S[j]);
+          for(const r of res){
+            if(r.empty){ steps.push(`Resolve ${clToStr(S[i])} with ${clToStr(S[j])} → ∅`); return {success:true, steps, clauses:[...S, r]}; }
+            if(add(r)){ newDerived = true; steps.push(`Resolve ${clToStr(S[i])} with ${clToStr(S[j])} → ${clToStr(r)}`); }
+          }
+        }
+      }
+    }
+    return {success:false, steps, clauses:S};
+  }
+
+  // ---------- NL → structures ----------
+  function extractStructuresFromPassage(passage){
+    const sents = splitSentences(passage);
+    const structs = [];
+    for(const s of sents){
+      const det = detectPattern(s);
+      if(det.type==='implication'){
+        structs.push({kind:'implication', label: det.raw, antecedentText: det.antecedent, consequentText: det.consequent, raw: det.raw});
+      } else {
+        structs.push({kind:'fact', label: det.raw, subj: det.subj || null, obj: det.obj || null, raw: det.raw});
+      }
+    }
+    return structs;
+  }
+
+  // ---------- Token helpers ----------
+  function splitPieces(text){ return text.split(/,\s*|\s+and\s+|;\s*|:\s*/i).map(p=>p.trim()).filter(Boolean); }
+  function words(text){ return tokenizeWords(text).map(stem); }
+
+  // ---------- Build mapping and CNF ----------
+  function autoMapAndGenerate(){
+    const passage = $passage.value.trim();
+    if(!passage){ alert('Please paste a passage first.'); return; }
+
+    const structs = extractStructuresFromPassage(passage);
+    const labeled = structs.map(st => ({label: st.label, struct: st}));
+    const assigned = assignSymbols(labeled);
+
+    // Build symbolMap from entries
+    const symbolMap = assigned.entries.reduce((acc, e) => {
+      const label = (e.struct && e.struct.label) ? e.struct.label : (e.label ? e.label : JSON.stringify(e.struct));
+      acc[e.sym] = label;
+      return acc;
+    }, {});
+
+    // Generate CNF: default facts (A), plus attempt to add implication clauses
+    const clauses = [];
+    assigned.entries.forEach(ent => { clauses.push(`(${ent.sym})`); });
+
+    // try to map implication sentences to symbol-level clauses (¬A ∨ ¬B ∨ C)
+    const sents = splitSentences(passage);
+    for(const s of sents){
+      const det = detectPattern(s);
+      if(det.type==='implication'){
+        const ants = splitPieces(det.antecedent);
+        const cons = splitPieces(det.consequent);
+        const antSyms = [], consSyms = [];
+        for(const a of ants){
+          for(const sym of Object.keys(symbolMap)){
+            const descWords = words(symbolMap[sym]); const aWords = words(a);
+            if(aWords.some(w=>descWords.includes(w))){ antSyms.push(sym); break; }
+          }
+        }
+        for(const c of cons){
+          for(const sym of Object.keys(symbolMap)){
+            const descWords = words(symbolMap[sym]); const cWords = words(c);
+            if(cWords.some(w=>descWords.includes(w))){ consSyms.push(sym); break; }
+          }
+        }
+        if(antSyms.length && consSyms.length){
+          const clause = [];
+          antSyms.forEach(a=>clause.push(symNot+a));
+          consSyms.forEach(c=>clause.push(c));
+          clauses.push('(' + clause.join(' '+symOr+' ') + ')');
+        }
+      }
+    }
+
+    // Fill UI
+    $mapping.value = Object.keys(symbolMap).sort().map(k => `${k}: ${symbolMap[k]}`).join('\n');
+    $premises.value = clauses.join('\n');
+    updateMappingOutput(symbolMap);
+
+    // auto-fill query from reasoning question
+    const best = findBestSymbolForQuestion($reasoningQuery.value || '', symbolMap);
+    if(best) $query.value = best;
+
+    // attempt answer from passage
+    const answer = answerQuestion($reasoningQuery.value || '', passage);
+    $nlAnswer.textContent = answer || '(no answer derived)';
+  }
+
+  // ---------- Query auto-fill ----------
+  function findBestSymbolForQuestion(question, symbolMap){
+    const qwords = words(question);
+    let best = null; let bestScore = 0;
+    for(const [sym, desc] of Object.entries(symbolMap)){
+      const dwords = words(desc);
+      let score = 0; for(const qw of qwords) for(const dw of dwords) if(qw===dw) score++;
+      if(score > bestScore){ bestScore = score; best = sym; }
+    }
+    return bestScore > 0 ? best : null;
+  }
+
+  // ---------- Lightweight QA engine ----------
+  function normalizeName(n){ return n.replace(/\b(Mr\.|Mrs\.|Ms\.|Dr\.)\s*/gi,'').trim(); }
+  function extractNames(listText){
+    // split by commas/and; keep capitalized tokens as names
+    return splitPieces(listText).map(t=>t.replace(/^\s*(named|called)\s+/i,'').trim())
+      .filter(x=>/[A-Z][a-z]+/.test(x)).map(normalizeName);
+  }
+  function answerQuestion(q, passage){
+    const question = q.trim();
+    if(!question) return '';
+
+    // Patterns: daughters/sons/children of X
+    const whoChildren = question.match(/who\s+are\s+(.+?)'s\s+(daughters|sons|children)\??/i);
+    if(whoChildren){
+      const person = normalizeName(whoChildren[1]);
+      const kind = whoChildren[2].toLowerCase();
+      const sents = splitSentences(passage);
+      // look for sentences mentioning person + daughters/sons/children and extract names
+      const names = [];
+      for(const s of sents){
+        const lower = s.toLowerCase();
+        if(lower.includes(person.toLowerCase()) && lower.match(new RegExp(kind))){
+          // try "... had two daughters, Priya and Kavya."
+          const m = s.match(/(?:daughters|sons|children)[^:]*[:]\s*([A-Za-z ,and]+)/i)
+                  || s.match(/(?:daughters|sons|children)[^.,]*,\s*([A-Za-z ,and]+)/i);
+          if(m){ names.push(...extractNames(m[1])); }
+          // try "X's daughters are A and B."
+          const m2 = s.match(new RegExp(person+"[^.]*\\b"+kind+"\\b[^.]*\\bare\\b\\s*([A-Za-z ,and]+)","i"));
+          if(m2){ names.push(...extractNames(m2[1])); }
+          // fallback: any capitalized pairs near the keyword
+          const m3 = s.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*(?:,|\s+and\s+)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/);
+          if(m3){ names.push(normalizeName(m3[1]), normalizeName(m3[2])); }
+        }
+      }
+      const uniq = Array.from(new Set(names));
+      if(uniq.length){ return `${person}'s ${kind}: ${uniq.join(', ')}`; }
+      return `No explicit ${kind} found for ${person}.`;
+    }
+
+    // Marriage: who did X marry?
+    const whoMarried = question.match(/who\s+(did|does)\s+(.+?)\s+marry\??/i) || question.match(/who\s+is\s+(.+?)\s+married\s+to\??/i);
+    if(whoMarried){
+      const person = normalizeName(whoMarried[2] || whoMarried[1]);
+      const sents = splitSentences(passage);
+      for(const s of sents){
+        const m = s.match(new RegExp(person+"\\s+married\\s+([A-Za-z][A-Za-z\\s]+)","i"));
+        if(m){ return `${person} married ${normalizeName(m[1].replace(/[.,]$/,''))}`; }
+      }
+      return `No explicit spouse found for ${person}.`;
+    }
+
+    // Grandchildren: who are X's grandchildren?
+    const whoGrandkids = question.match(/who\s+are\s+(.+?)'s\s+grandchildren\??/i);
+    if(whoGrandkids){
+      const entity = normalizeName(whoGrandkids[1]);
+      const sents = splitSentences(passage);
+      for(const s of sents){
+        const m = s.match(new RegExp("granddaughters?\\s+of\\s+"+entity+"[^.]*","i"));
+        const n = s.match(new RegExp("grandson\\s+of\\s+"+entity+"[^.]*","i"));
+        const names = [];
+        if(m){
+          const list = m[0].match(/granddaughters?[^:]*:\s*([A-Za-z ,and]+)/i) || m[0].match(/are\s+([A-Za-z ,and]+)/i);
+          if(list) names.push(...extractNames(list[1]));
+        }
+        if(n){
+          const nm = n[0].match(/grandson[^:]*[:]\s*([A-Za-z ,and]+)/i) || n[0].match(/is\s+([A-Za-z][A-Za-z\s]+)/i);
+          if(nm) names.push(...extractNames(nm[1]));
+        }
+        if(names.length){ return `${entity}'s grandchildren: ${Array.from(new Set(names)).join(', ')}`; }
+      }
+      return `No explicit grandchildren found for ${entity}.`;
+    }
+
+    // Default: match best symbol by keywords and return its label
+    const symbolMap = parseMappingToObj($mapping.value);
+    const best = findBestSymbolForQuestion(question, symbolMap);
+    if(best){ return `Target proposition: ${best} ≡ ${symbolMap[best]}`; }
+    return '';
+  }
+
+  // ---------- UI wiring ----------
+  const $passage = document.getElementById('passage');
+  const $autoMap = document.getElementById('autoMap');
+  const $mapping = document.getElementById('mapping');
+  const $premises = document.getElementById('premises');
+  const $reasoningQuery = document.getElementById('reasoningQuery');
+  const $query = document.getElementById('query');
+  const $nlAnswer = document.getElementById('nlAnswer');
+  const $mappingOutput = document.getElementById('mappingOutput');
+  const $stepsOutput = document.getElementById('stepsOutput');
+  const $clausesOutput = document.getElementById('clausesOutput');
+  const $run = document.getElementById('run');
+  const $clear = document.getElementById('clear');
+  const $loadExample = document.getElementById('loadExample');
+
+  function updateMappingOutput(symbolMap){
+    const lines = Object.keys(symbolMap).length ? Object.keys(symbolMap).sort().map(k => `${k} ≡ ${symbolMap[k]}`) : ['(no mapping)'];
+    $mappingOutput.textContent = lines.join('\n');
+  }
+  function parseMappingToObj(text){
+    const map = {};
+    const lines = text.split('\n').map(l=>l.trim()).filter(Boolean);
+    for(const ln of lines){
+      const m = ln.match(/^([A-Za-z])\s*:\s*(.+)$/);
+      if(m) map[m[1]] = m[2];
+    }
+    return map;
+  }
+
+  function runResolution(){
+    const clauseLines = $premises.value.split('\n').map(l=>l.trim()).filter(Boolean);
+    const parsed = clauseLines.map(parseClauseText).filter(Boolean);
+    const q = $query.value.trim();
+    if(!q){ alert('Query not set. Type a reasoning question to auto-fill or choose a symbol.'); return; }
+    const neg = q.startsWith(symNot) ? q.slice(symNot.length) : symNot + q;
+    const negParsed = parseClauseText('(' + neg + ')');
+    if(!negParsed){ alert('Could not parse negated query.'); return; }
+    const res = resolutionProveFromClauses(parsed, negParsed);
+    $stepsOutput.textContent = res.steps.length ? res.steps.join('\n') : '(no resolvents derived)';
+    $clausesOutput.textContent = res.clauses.map(clToStr).join('\n');
+  }
+
+  function loadSharmaExample(){
+    $passage.value = "Mr. and Mrs. Sharma had two children: a son named Raj and a daughter named Meera. Raj grew up and married Anika. Together, they had two daughters, Priya and Kavya. Meera married Arjun, and they had one son, Rohan. This means Priya and Kavya are the granddaughters of Mr. and Mrs. Sharma, while Rohan is their grandson. Priya, Kavya, and Rohan are cousins because their parents, Raj and Meera, are siblings.";
+    $reasoningQuery.value = "Who are Raj's daughters?";
+    autoMapAndGenerate();
+  }
+
+  // events
+  $autoMap.addEventListener('click', autoMapAndGenerate);
+  $run.addEventListener('click', runResolution);
+  $clear.addEventListener('click', ()=>{ $passage.value=''; $mapping.value=''; $premises.value=''; $reasoningQuery.value=''; $query.value=''; $nlAnswer.textContent='(no answer yet)'; $mappingOutput.textContent='(none)'; $stepsOutput.textContent='(no run yet)'; $clausesOutput.textContent='(no run yet)'; });
+  $loadExample.addEventListener('click', loadSharmaExample);
+  $reasoningQuery.addEventListener('input', ()=>{
+    const symbolMap = parseMappingToObj($mapping.value);
+    const best = findBestSymbolForQuestion($reasoningQuery.value, symbolMap);
+    if(best) $query.value = best;
+    const answer = answerQuestion($reasoningQuery.value, $passage.value);
+    if(answer) $nlAnswer.textContent = answer;
+  });
+
+  // init
+  updateMappingOutput({});
+  </script>
+</body>
+</html>
